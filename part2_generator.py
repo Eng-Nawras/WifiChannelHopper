@@ -38,7 +38,8 @@ OCCUPANCY_THRESHOLD_DB = -55           # power (dBFS-ish) above which a channel 
                                         # -> calibrate this against a known-idle channel first
 
 TX_BANDWIDTH = 20e6                    # Hz - generated signal bandwidth (match a Wi-Fi channel)
-TX_GAIN = -10                          # dB - keep LOW; see safety notice in the assignment
+TX_GAIN = -45                          # dB - keep LOW; see safety notice in the assignment
+                                        # (-45 dB for safe initial bench testing; raise deliberately later)
 RE_EVALUATE_PERIOD = 2.0               # seconds between re-sensing / possible hops
 
 # ----------------------------------------------------------------------------
@@ -197,7 +198,12 @@ def main():
             occupied = get_occupied_channels(freqs, power_db)
 
             # --- 2. Choose best channel ---
-            new_channel = choose_best_channel(occupied)
+            # Exclude the channel we're currently transmitting on: our own TX
+            # leaking into the RX front end during sensing can make it look
+            # "occupied", which would otherwise cause the algorithm to hop
+            # away from its own signal every cycle instead of settling.
+            occupied_for_selection = [ch for ch in occupied if ch != current_channel]
+            new_channel = choose_best_channel(occupied_for_selection)
 
             # --- 3. Hop if needed ---
             if new_channel != current_channel:
