@@ -21,7 +21,7 @@ import adi  # from pyadi-iio
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------------
 
-PLUTO_URI = "ip:192.168.2.1"          # default Pluto IP over USB; change if needed
+PLUTO_URI = "usb:1.4.5"          # default Pluto IP over USB; change if needed
 
 BAND_START = 2400e6                    # Hz - start of 2.4 GHz ISM band
 BAND_STOP = 2500e6                     # Hz - end of 2.4 GHz ISM band
