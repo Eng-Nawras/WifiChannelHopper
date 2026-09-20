@@ -1,147 +1,431 @@
 """
 ENCS5323 - Wireless and Mobile Networks
-Project - Part 2: Dynamic Channel-Hopping Wi-Fi-like Interference Generator
-Hardware: ADALM-PLUTO SDR (used for BOTH sensing and transmitting in standalone mode,
-          or ONLY transmitting when run together with Part 1 on a second Pluto unit)
+Part 2: Dynamic Channel-Hopping Wi-Fi-like Signal Generator
+ADALM-PLUTO SDR
 
-Author: <your name / student number>
+Designed for the controlled indoor lab setup required by the assignment.
 
-HOW TO RUN (basic):
-    python part2_generator.py
-
-HOW TO RUN (for the systematic experiments the assignment asks for):
-    python part2_generator.py --bandwidth 10e6 --duration 40
-    python part2_generator.py --bandwidth 20e6 --duration 40
-    python part2_generator.py --center 2437e6 --duration 40   (force a fixed TX channel instead of auto-hop)
-
-Every run appends one row per sensing cycle to logs/part2_log.csv, which is
-exactly the data needed for the report: chosen channel, occupied channels,
-reaction time, and the TX settings used for that run.
+Main fixes in this version:
+- Uses the Pluto device IP from the config file: 192.168.2.2
+- Uses sdr.sample_rate (shared Pluto sample rate)
+- Stops TX before sensing, so the Pluto does not classify its own TX as occupancy
+- Uses the same sweep idea as Part 1 to cover 2400-2500 MHz
+- Uses an adaptive noise-floor + margin occupancy decision
+- Restarts TX after every sensing cycle, even if it stays on the same channel
+- Generates a bandwidth-limited Wi-Fi-like wideband test waveform
+- Logs occupied channels, selected channel, hopping, and reaction time
 """
 
 import argparse
 import csv
-import os
 import time
+from pathlib import Path
 
 import numpy as np
-import adi  # from pyadi-iio
+from scipy.signal import welch
+import adi
 
-# ----------------------------------------------------------------------------
-# 1. CONFIGURATION
-# ----------------------------------------------------------------------------
 
-PLUTO_URI = "usb:1.4.5"                # direct USB connection (from `iio_info -s`)
-                                        # NOTE: this address can change if you unplug/replug
-                                        # the device or use a different port/PC. Re-run
-                                        # `iio_info -s` and update this string if connection fails.
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-BAND_START = 2400e6                    # Hz - start of 2.4 GHz ISM band
-BAND_STOP = 2500e6                     # Hz - end of 2.4 GHz ISM band
+# From your Pluto config file:
+#   ipaddr      = 192.168.2.2   -> Pluto device
+#   ipaddr_host = 192.168.2.10  -> PC-side USB Ethernet address
+PLUTO_URI = "ip:192.168.2.2"
 
-# Standard Wi-Fi 2.4 GHz channel centre frequencies (channels 1-13, 20 MHz each)
-WIFI_CHANNELS = {ch: 2412e6 + (ch - 1) * 5e6 for ch in range(1, 14)}
-CHANNEL_BW = 20e6                      # Hz - Wi-Fi channel bandwidth (for sensing bins)
+BAND_START_HZ = 2400e6
+BAND_STOP_HZ = 2500e6
 
-SENSE_SAMPLE_RATE = 61.44e6            # Hz - RX sample rate used while scanning
-SENSE_NFFT = 4096                      # FFT size for the sensing spectrum
-SENSE_DURATION = 0.05                  # seconds of samples per sensing snapshot
+# Practical receive settings, matching Part 1 closely
+SAMPLE_RATE_HZ = 30e6
+RF_BANDWIDTH_HZ = 30e6
+USABLE_FRACTION = 0.8
 
-OCCUPANCY_THRESHOLD_DB = -55           # calibrated against real measurements:
-                                        # idle channels ~ -57 to -62 dB, Tareq network
-                                        # (ch 8-11) ~ -49 to -52 dB on this bench setup.
+N_SAMPLES = 2**16
+NPERSEG = 1024
 
-DEFAULT_TX_BANDWIDTH = 20e6            # Hz - default generated signal bandwidth
-TX_GAIN = -45                          # dB - safe initial bench testing level
-RE_EVALUATE_PERIOD = 2.0               # seconds between re-sensing / possible hops
+RX_GAIN_DB = 30
+GAIN_MODE = "manual"
 
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "part2_log.csv")
+# Standard 2.4 GHz Wi-Fi channels 1-13
+WIFI_CHANNELS_HZ = {
+    1: 2412e6,
+    2: 2417e6,
+    3: 2422e6,
+    4: 2427e6,
+    5: 2432e6,
+    6: 2437e6,
+    7: 2442e6,
+    8: 2447e6,
+    9: 2452e6,
+    10: 2457e6,
+    11: 2462e6,
+    12: 2467e6,
+    13: 2472e6,
+}
 
-# ----------------------------------------------------------------------------
-# 2. CONNECT TO PLUTO
-# ----------------------------------------------------------------------------
+CHANNEL_WIDTH_HZ = 20e6
 
-def connect_pluto(uri=PLUTO_URI, tx_bandwidth=DEFAULT_TX_BANDWIDTH):
-    sdr = adi.Pluto(uri)
-    sdr.rx_lo = int(2450e6)             # will be re-tuned per scan step
-    sdr.rx_rf_bandwidth = int(SENSE_SAMPLE_RATE)
-    sdr.rx_sample_rate = int(SENSE_SAMPLE_RATE)
-    sdr.gain_control_mode_chan0 = "manual"
-    sdr.rx_hardwaregain_chan0 = 30
-    sdr.rx_buffer_size = int(SENSE_SAMPLE_RATE * SENSE_DURATION)
+# Adaptive occupancy threshold:
+# occupied if channel power > estimated noise floor + this margin
+OCCUPANCY_MARGIN_DB = 6.0
 
-    sdr.tx_lo = int(2437e6)             # placeholder, set properly before each hop
-    sdr.tx_rf_bandwidth = int(tx_bandwidth)
-    sdr.tx_sample_rate = int(tx_bandwidth)
-    sdr.tx_hardwaregain_chan0 = TX_GAIN
+DEFAULT_TX_BANDWIDTH_HZ = 20e6
+
+# Keep TX weak for controlled bench/lab testing
+TX_GAIN_DB = -45
+
+# Re-sense / re-evaluate every 2 seconds
+RE_EVALUATE_PERIOD_S = 2.0
+
+# Give RX a moment after stopping TX
+TX_TO_RX_SETTLE_S = 0.10
+
+# Assignment recommends short test runs
+DEFAULT_DURATION_S = 40.0
+MAX_DURATION_S = 60.0
+
+TX_BUFFER_SAMPLES = 65536
+
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "part2_log.csv"
+
+
+# ============================================================
+# SWEEP FREQUENCIES
+# ============================================================
+
+def build_center_frequencies():
+    """
+    Build the center frequencies needed to cover 2400-2500 MHz.
+    Only the central part of each RX capture is kept.
+    """
+    usable_bw = SAMPLE_RATE_HZ * USABLE_FRACTION
+
+    centers = []
+    f = BAND_START_HZ + usable_bw / 2
+
+    while f - usable_bw / 2 < BAND_STOP_HZ:
+        centers.append(f)
+        f += usable_bw
+
+    return centers, usable_bw
+
+
+# ============================================================
+# CONNECT TO PLUTO
+# ============================================================
+
+def connect_pluto(tx_bandwidth_hz):
+    print(f"Connecting to Part 2 Pluto at {PLUTO_URI} ...")
+
+    sdr = adi.Pluto(PLUTO_URI)
+
+    # Pluto uses one common sample-rate setting for RX/TX
+    sdr.sample_rate = int(SAMPLE_RATE_HZ)
+
+    # RX
+    sdr.rx_rf_bandwidth = int(RF_BANDWIDTH_HZ)
+    sdr.rx_buffer_size = int(N_SAMPLES)
+    sdr.gain_control_mode_chan0 = GAIN_MODE
+
+    if GAIN_MODE == "manual":
+        sdr.rx_hardwaregain_chan0 = RX_GAIN_DB
+
+    # TX
+    sdr.tx_rf_bandwidth = int(tx_bandwidth_hz)
+    sdr.tx_hardwaregain_chan0 = TX_GAIN_DB
+    sdr.tx_cyclic_buffer = True
+
+    # Placeholder; changed before every TX start
+    sdr.tx_lo = int(2437e6)
+
+    print("Part 2 Pluto connected.")
     return sdr
 
 
-# ----------------------------------------------------------------------------
-# 3. SENSING: figure out which Wi-Fi channels are occupied right now
-# ----------------------------------------------------------------------------
+# ============================================================
+# TX CONTROL
+# ============================================================
 
-def scan_band_power(sdr):
-    step = SENSE_SAMPLE_RATE * 0.9      # slight overlap between steps
-    centers = np.arange(BAND_START + step / 2, BAND_STOP, step)
+def stop_tx(sdr):
+    """Stop any active cyclic TX buffer."""
+    try:
+        sdr.tx_destroy_buffer()
+    except Exception:
+        pass
+
+
+def generate_wifi_like_signal(
+    sample_rate_hz,
+    bandwidth_hz,
+    n_samples=TX_BUFFER_SAMPLES
+):
+    """
+    Generate a controlled wideband pseudo-OFDM / Wi-Fi-like waveform.
+
+    It is NOT a decodable 802.11 frame. It is a wideband test signal
+    with energy limited to approximately the requested bandwidth.
+    """
+
+    if bandwidth_hz <= 0:
+        raise ValueError("TX bandwidth must be greater than 0.")
+
+    if bandwidth_hz >= sample_rate_hz:
+        raise ValueError(
+            f"TX bandwidth must be below sample rate "
+            f"({sample_rate_hz / 1e6:.1f} MHz)."
+        )
+
+    freqs = np.fft.fftfreq(
+        n_samples,
+        d=1.0 / sample_rate_hz
+    )
+
+    # Use 90% of the requested bandwidth to leave guard space
+    active = np.abs(freqs) <= (0.45 * bandwidth_hz)
+
+    spectrum = np.zeros(
+        n_samples,
+        dtype=np.complex64
+    )
+
+    rng = np.random.default_rng()
+
+    count = np.count_nonzero(active)
+
+    # QPSK-like random frequency-domain values
+    re = rng.choice([-1.0, 1.0], size=count)
+    im = rng.choice([-1.0, 1.0], size=count)
+
+    spectrum[active] = (
+        re + 1j * im
+    ).astype(np.complex64)
+
+    # Remove DC carrier component
+    dc_index = np.argmin(np.abs(freqs))
+    spectrum[dc_index] = 0
+
+    iq = np.fft.ifft(spectrum).astype(np.complex64)
+
+    peak = np.max(np.abs(iq))
+
+    if peak > 0:
+        iq /= peak
+
+    # Conservative digital amplitude
+    iq *= (0.5 * (2**14))
+
+    return iq.astype(np.complex64)
+
+
+def start_tx(sdr, tx_freq_hz, tx_bandwidth_hz):
+    """Start cyclic transmission on the selected center frequency."""
+
+    sdr.tx_lo = int(tx_freq_hz)
+    sdr.tx_rf_bandwidth = int(tx_bandwidth_hz)
+    sdr.tx_cyclic_buffer = True
+
+    iq_signal = generate_wifi_like_signal(
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        bandwidth_hz=tx_bandwidth_hz
+    )
+
+    sdr.tx(iq_signal)
+
+
+# ============================================================
+# SENSING
+# ============================================================
+
+def capture_psd_at(sdr, center_hz):
+    """
+    Tune RX to one center frequency and return
+    frequency + relative PSD in dB.
+    """
+
+    sdr.rx_lo = int(center_hz)
+
+    # Allow LO to settle
+    time.sleep(0.05)
+
+    # Flush one stale buffer
+    sdr.rx()
+
+    samples = sdr.rx()
+
+    freqs, psd = welch(
+        samples,
+        fs=SAMPLE_RATE_HZ,
+        nperseg=NPERSEG,
+        return_onesided=False,
+        scaling="density"
+    )
+
+    freqs = np.fft.fftshift(freqs) + center_hz
+    psd = np.fft.fftshift(psd)
+
+    power_db = 10 * np.log10(
+        psd + 1e-20
+    )
+
+    # Remove center-frequency / DC artifact
+    dc_bin_width = 3 * (
+        SAMPLE_RATE_HZ / NPERSEG
+    )
+
+    notch_mask = (
+        np.abs(freqs - center_hz) <
+        dc_bin_width
+    )
+
+    if notch_mask.any() and not notch_mask.all():
+        power_db[notch_mask] = np.interp(
+            freqs[notch_mask],
+            freqs[~notch_mask],
+            power_db[~notch_mask]
+        )
+
+    return freqs, power_db
+
+
+def scan_band_power(sdr, centers, usable_bw):
+    """
+    Sweep across 2400-2500 MHz and stitch the useful
+    center parts of the captures together.
+    """
 
     all_freqs = []
     all_power = []
 
     for center in centers:
-        sdr.rx_lo = int(center)
-        time.sleep(0.01)                # let the LO settle
-        samples = sdr.rx()
-
-        window = np.hanning(len(samples))
-        spectrum = np.fft.fftshift(np.fft.fft(samples * window, n=SENSE_NFFT))
-        power_db = 20 * np.log10(np.abs(spectrum) + 1e-12)
-        freqs = center + np.fft.fftshift(
-            np.fft.fftfreq(SENSE_NFFT, d=1 / SENSE_SAMPLE_RATE)
+        freqs, power_db = capture_psd_at(
+            sdr,
+            center
         )
 
-        all_freqs.append(freqs)
-        all_power.append(power_db)
+        lo_edge = center - usable_bw / 2
+        hi_edge = center + usable_bw / 2
 
-    freqs = np.concatenate(all_freqs)
-    power_db = np.concatenate(all_power)
-    order = np.argsort(freqs)
-    return freqs[order], power_db[order]
+        mask = (
+            (freqs >= lo_edge) &
+            (freqs <= hi_edge)
+        )
+
+        all_freqs.append(freqs[mask])
+        all_power.append(power_db[mask])
+
+    freqs_full = np.concatenate(all_freqs)
+    power_full = np.concatenate(all_power)
+
+    order = np.argsort(freqs_full)
+
+    freqs_full = freqs_full[order]
+    power_full = power_full[order]
+
+    band_mask = (
+        (freqs_full >= BAND_START_HZ) &
+        (freqs_full <= BAND_STOP_HZ)
+    )
+
+    return (
+        freqs_full[band_mask],
+        power_full[band_mask]
+    )
 
 
-def get_occupied_channels(freqs, power_db):
-    occupied = []
-    for ch, f_center in WIFI_CHANNELS.items():
-        mask = (freqs >= f_center - CHANNEL_BW / 2) & (freqs <= f_center + CHANNEL_BW / 2)
-        if not np.any(mask):
-            continue
-        avg_power = np.mean(power_db[mask])
-        if avg_power > OCCUPANCY_THRESHOLD_DB:
-            occupied.append(ch)
-    return occupied
+def calculate_channel_powers(freqs_hz, power_db):
+    """
+    Average measured power inside each 20 MHz
+    Wi-Fi channel region.
+    """
+
+    channel_power = {}
+
+    for ch, center_hz in WIFI_CHANNELS_HZ.items():
+
+        lo = center_hz - CHANNEL_WIDTH_HZ / 2
+        hi = center_hz + CHANNEL_WIDTH_HZ / 2
+
+        mask = (
+            (freqs_hz >= lo) &
+            (freqs_hz <= hi)
+        )
+
+        if np.any(mask):
+            channel_power[ch] = float(
+                np.mean(power_db[mask])
+            )
+        else:
+            channel_power[ch] = np.nan
+
+    return channel_power
 
 
-# ----------------------------------------------------------------------------
-# 4. CHANNEL SELECTION: max-min distance from occupied channels
-# ----------------------------------------------------------------------------
+def get_occupied_channels(channel_power):
+    """
+    Estimate the noise floor from the current channel powers.
+    A channel is occupied when it is sufficiently above that floor.
+    """
 
-def choose_best_channel(occupied_channels, all_channels=None):
-    if all_channels is None:
-        all_channels = list(WIFI_CHANNELS.keys())
+    values = np.array(
+        list(channel_power.values()),
+        dtype=float
+    )
+
+    noise_floor = float(
+        np.nanpercentile(values, 20)
+    )
+
+    threshold = (
+        noise_floor + OCCUPANCY_MARGIN_DB
+    )
+
+    occupied = [
+        ch
+        for ch, p in channel_power.items()
+        if np.isfinite(p) and p > threshold
+    ]
+
+    return occupied, noise_floor, threshold
+
+
+# ============================================================
+# CHANNEL SELECTION
+# ============================================================
+
+def choose_best_channel(occupied_channels):
+    """
+    Choose the standard Wi-Fi channel whose center frequency
+    has the greatest minimum distance from all occupied channels.
+    """
+
+    all_channels = list(
+        WIFI_CHANNELS_HZ.keys()
+    )
 
     if not occupied_channels:
-        return 6  # reasonable default when the band is empty
+        return 6
 
     best_channel = None
-    best_min_distance = -1
+    best_min_distance = -1.0
 
     for candidate in all_channels:
-        distances = [
-            abs(WIFI_CHANNELS[candidate] - WIFI_CHANNELS[occ]) / 1e6
+
+        distances_mhz = [
+            abs(
+                WIFI_CHANNELS_HZ[candidate] -
+                WIFI_CHANNELS_HZ[occ]
+            ) / 1e6
             for occ in occupied_channels
         ]
-        min_distance = min(distances)
+
+        min_distance = min(
+            distances_mhz
+        )
 
         if min_distance > best_min_distance:
             best_min_distance = min_distance
@@ -150,116 +434,339 @@ def choose_best_channel(occupied_channels, all_channels=None):
     return best_channel
 
 
-# ----------------------------------------------------------------------------
-# 5. SIGNAL GENERATION: build a Wi-Fi-like baseband waveform
-# ----------------------------------------------------------------------------
-
-def generate_wifi_like_signal(sample_rate, duration=0.01):
-    n = int(sample_rate * duration)
-    real = np.random.normal(0, 1, n)
-    imag = np.random.normal(0, 1, n)
-    iq = (real + 1j * imag).astype(np.complex64)
-    iq /= np.max(np.abs(iq))
-    iq *= 2 ** 14
-    return iq
-
-
-# ----------------------------------------------------------------------------
-# 6. LOGGING
-# ----------------------------------------------------------------------------
+# ============================================================
+# LOGGING
+# ============================================================
 
 def init_log():
-    os.makedirs(LOG_DIR, exist_ok=True)
-    is_new = not os.path.exists(LOG_FILE)
-    f = open(LOG_FILE, "a", newline="")
+
+    LOG_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    is_new = not LOG_FILE.exists()
+
+    f = open(
+        LOG_FILE,
+        "a",
+        newline=""
+    )
+
     writer = csv.writer(f)
+
     if is_new:
         writer.writerow([
-            "timestamp", "tx_bandwidth_hz", "forced_center_hz",
-            "occupied_channels", "chosen_channel", "chosen_freq_hz",
-            "hopped_this_cycle", "reaction_time_s",
+            "timestamp",
+            "tx_bandwidth_hz",
+            "forced_center_hz",
+            "noise_floor_db",
+            "occupancy_threshold_db",
+            "occupied_channels",
+            "chosen_channel",
+            "chosen_freq_hz",
+            "hopped_this_cycle",
+            "reaction_time_s"
         ])
+
     return f, writer
 
 
-# ----------------------------------------------------------------------------
-# 7. MAIN LOOP
-# ----------------------------------------------------------------------------
+# ============================================================
+# ARGUMENT VALIDATION
+# ============================================================
+
+def validate_args(args):
+
+    if args.bandwidth <= 0:
+        raise ValueError(
+            "Bandwidth must be greater than 0."
+        )
+
+    if args.bandwidth > 20e6:
+        raise ValueError(
+            "For this project, keep TX bandwidth at or below 20 MHz."
+        )
+
+    if args.bandwidth >= SAMPLE_RATE_HZ:
+        raise ValueError(
+            "Bandwidth must be below the 30 MHz sample rate."
+        )
+
+    if args.duration <= 0:
+        raise ValueError(
+            "Duration must be greater than 0."
+        )
+
+    if args.duration > MAX_DURATION_S:
+        raise ValueError(
+            f"Keep the controlled test at or below "
+            f"{MAX_DURATION_S:.0f} seconds."
+        )
+
+    if args.center is not None:
+        if not (
+            WIFI_CHANNELS_HZ[1] <= args.center <= WIFI_CHANNELS_HZ[13]
+        ):
+            raise ValueError(
+                "Forced center must stay between "
+                "2412 MHz and 2472 MHz."
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Part 2: Wi-Fi-like interference generator")
-    parser.add_argument("--bandwidth", type=float, default=DEFAULT_TX_BANDWIDTH,
-                         help="TX signal bandwidth in Hz, e.g. 5e6, 10e6, 20e6 (default 20e6)")
-    parser.add_argument("--center", type=float, default=None,
-                         help="Force a fixed TX centre frequency in Hz instead of auto-hopping "
-                              "(e.g. 2437e6). Sensing/logging still runs for comparison.")
-    parser.add_argument("--duration", type=float, default=None,
-                         help="Auto-stop after this many seconds (recommended: 30-60, "
-                              "per the assignment's safety notice). Omit to run until Ctrl+C.")
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Part 2: Dynamic channel-hopping "
+            "Wi-Fi-like signal generator"
+        )
+    )
+
+    parser.add_argument(
+        "--bandwidth",
+        type=float,
+        default=DEFAULT_TX_BANDWIDTH_HZ,
+        help=(
+            "TX bandwidth in Hz. "
+            "Examples: 5e6, 10e6, 20e6."
+        )
+    )
+
+    parser.add_argument(
+        "--center",
+        type=float,
+        default=None,
+        help=(
+            "Force a fixed TX center frequency in Hz "
+            "instead of auto-hop, e.g. 2437e6."
+        )
+    )
+
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=DEFAULT_DURATION_S,
+        help=(
+            "Controlled run duration in seconds. "
+            "Default 40, maximum 60."
+        )
+    )
+
     args = parser.parse_args()
+    validate_args(args)
 
-    sdr = connect_pluto(tx_bandwidth=args.bandwidth)
-    current_channel = None
+    centers, usable_bw = (
+        build_center_frequencies()
+    )
+
+    print()
+    print("======================================")
+    print("Part 2 - Dynamic Channel Hopping")
+    print("======================================")
+    print(f"Pluto URI: {PLUTO_URI}")
+    print(
+        f"TX bandwidth: "
+        f"{args.bandwidth / 1e6:.1f} MHz"
+    )
+    print(
+        f"Mode: "
+        f"{'AUTO-HOP' if args.center is None else 'FIXED'}"
+    )
+    print(
+        f"Duration: {args.duration:.0f} seconds"
+    )
+    print(
+        "Sensing centers:",
+        [
+            f"{c / 1e6:.1f} MHz"
+            for c in centers
+        ]
+    )
+    print()
+
+    sdr = connect_pluto(
+        tx_bandwidth_hz=args.bandwidth
+    )
+
     log_file, writer = init_log()
-    start_time = time.time()
 
-    print(f"Starting run: bandwidth={args.bandwidth/1e6:.1f} MHz, "
-          f"forced_center={'auto-hop' if args.center is None else f'{args.center/1e6:.1f} MHz'}, "
-          f"duration={'until Ctrl+C' if args.duration is None else f'{args.duration:.0f}s'}")
+    current_channel = None
+    start_time = time.time()
 
     try:
         while True:
-            t0 = time.time()
-            if args.duration is not None and (t0 - start_time) >= args.duration:
-                print(f"Reached configured duration ({args.duration:.0f}s), stopping.")
+
+            cycle_start = time.time()
+
+            if (
+                cycle_start - start_time
+                >= args.duration
+            ):
+                print(
+                    f"Reached configured duration "
+                    f"({args.duration:.0f}s)."
+                )
                 break
 
-            # --- 1. Sense ---
-            freqs, power_db = scan_band_power(sdr)
-            occupied = get_occupied_channels(freqs, power_db)
+            # ----------------------------------------------
+            # 1. STOP TX BEFORE SENSING
+            # ----------------------------------------------
 
-            # --- 2. Choose channel (exclude the one we're currently transmitting on,
-            #        to avoid self-interference biasing the decision) ---
-            occupied_for_selection = [ch for ch in occupied if ch != current_channel]
+            stop_tx(sdr)
+            time.sleep(TX_TO_RX_SETTLE_S)
+
+            # ----------------------------------------------
+            # 2. SENSE FULL BAND
+            # ----------------------------------------------
+
+            freqs, power_db = scan_band_power(
+                sdr,
+                centers,
+                usable_bw
+            )
+
+            channel_power = (
+                calculate_channel_powers(
+                    freqs,
+                    power_db
+                )
+            )
+
+            (
+                occupied,
+                noise_floor,
+                threshold
+            ) = get_occupied_channels(
+                channel_power
+            )
+
+            # ----------------------------------------------
+            # 3. SELECT CHANNEL
+            # ----------------------------------------------
+
             if args.center is not None:
-                # fixed-frequency mode: pick the nearest standard channel just for logging
-                new_channel = min(WIFI_CHANNELS, key=lambda c: abs(WIFI_CHANNELS[c] - args.center))
-                tx_freq = args.center
+
+                tx_freq = float(
+                    args.center
+                )
+
+                new_channel = min(
+                    WIFI_CHANNELS_HZ,
+                    key=lambda ch: abs(
+                        WIFI_CHANNELS_HZ[ch] -
+                        tx_freq
+                    )
+                )
+
             else:
-                new_channel = choose_best_channel(occupied_for_selection)
-                tx_freq = WIFI_CHANNELS[new_channel]
 
-            # --- 3. Hop if needed ---
-            hopped = new_channel != current_channel
+                new_channel = (
+                    choose_best_channel(
+                        occupied
+                    )
+                )
+
+                tx_freq = (
+                    WIFI_CHANNELS_HZ[
+                        new_channel
+                    ]
+                )
+
+            hopped = (
+                new_channel != current_channel
+            )
+
+            # ----------------------------------------------
+            # 4. START TX AGAIN
+            # ----------------------------------------------
+
+            start_tx(
+                sdr,
+                tx_freq_hz=tx_freq,
+                tx_bandwidth_hz=args.bandwidth
+            )
+
+            # ----------------------------------------------
+            # 5. REPORT
+            # ----------------------------------------------
+
             if hopped:
-                sdr.tx_destroy_buffer()
-                sdr.tx_lo = int(tx_freq)
-                iq_signal = generate_wifi_like_signal(sample_rate=args.bandwidth)
-                sdr.tx_cyclic_buffer = True
-                sdr.tx(iq_signal)
-                current_channel = new_channel
-                print(f"[HOP] Occupied={occupied} -> Selected channel {new_channel} "
-                      f"({tx_freq/1e6:.1f} MHz, bw={args.bandwidth/1e6:.1f} MHz)")
+                status = "HOP"
+            else:
+                status = "STAY"
 
-            # --- 4. Log every cycle (not just hops) for the report ---
-            reaction_time = time.time() - t0
+            print(
+                f"[{status}] "
+                f"Occupied={occupied} | "
+                f"Noise={noise_floor:.1f} dB | "
+                f"Threshold={threshold:.1f} dB | "
+                f"Selected ch {new_channel} "
+                f"({tx_freq / 1e6:.1f} MHz)"
+            )
+
+            current_channel = new_channel
+
+            reaction_time = (
+                time.time() -
+                cycle_start
+            )
+
+            # ----------------------------------------------
+            # 6. LOG
+            # ----------------------------------------------
+
             writer.writerow([
-                time.strftime("%Y-%m-%d %H:%M:%S"), args.bandwidth,
-                args.center if args.center is not None else "",
-                ";".join(map(str, occupied)), current_channel, tx_freq,
-                hopped, f"{reaction_time:.3f}",
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+                args.bandwidth,
+                (
+                    args.center
+                    if args.center is not None
+                    else ""
+                ),
+                f"{noise_floor:.2f}",
+                f"{threshold:.2f}",
+                ";".join(
+                    map(str, occupied)
+                ),
+                current_channel,
+                tx_freq,
+                hopped,
+                f"{reaction_time:.3f}"
             ])
+
             log_file.flush()
 
-            # --- 5. Wait before re-evaluating ---
-            time.sleep(max(0, RE_EVALUATE_PERIOD - reaction_time))
+            # ----------------------------------------------
+            # 7. WAIT BEFORE NEXT RE-EVALUATION
+            # ----------------------------------------------
+
+            sleep_left = (
+                RE_EVALUATE_PERIOD_S -
+                reaction_time
+            )
+
+            if sleep_left > 0:
+                time.sleep(sleep_left)
 
     except KeyboardInterrupt:
-        print("Stopping generator (Ctrl+C)...")
+        print("Stopping Part 2...")
+
     finally:
-        sdr.tx_destroy_buffer()
+        stop_tx(sdr)
         log_file.close()
-        print(f"Log saved to {LOG_FILE}")
+
+        print()
+        print("TX stopped.")
+        print(
+            f"Log saved to: {LOG_FILE}"
+        )
 
 
 if __name__ == "__main__":
